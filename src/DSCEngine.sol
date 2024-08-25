@@ -49,6 +49,7 @@ contract DSCEngine is ReentrancyGuard {
     event CollateralRedeemed(
         address indexed redeemFrom, address indexed redeemTo, address indexed collateralTokenAddress, uint256 amount
     );
+    event DSCBurnt(address indexed user, address indexed dscFrom, uint256 amount);
 
     ////////////////
     // Errors     //
@@ -62,7 +63,7 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__CollateralRedemptionFailed();
     error DSCEngine__TransferFailed();
     error DSCEngine__HealthFactorOk();
-    error DSC_Engine__HealthFactorNotImproved();
+    error DSCEngine__HealthFactorNotImproved();
 
     ////////////////
     // Modifiers  //
@@ -147,8 +148,8 @@ contract DSCEngine is ReentrancyGuard {
         onlyAllowedCollateralToken(collateralTokenAddress)
         nonReentrant
     {
-        burnDSC(dscAmount);
-        redeemCollateral(collateralTokenAddress, collateralAmount);
+        _burnDSC(msg.sender, msg.sender, dscAmount);
+        _redeemCollateral(collateralTokenAddress, collateralAmount, msg.sender, msg.sender);
         // redeem collateral already checks health factor
     }
 
@@ -163,6 +164,7 @@ contract DSCEngine is ReentrancyGuard {
         nonReentrant
     {
         _redeemCollateral(collateralTokenAddress, amount, msg.sender, msg.sender);
+        _revertIfHealthFactorIsBroken(msg.sender);
     }
 
     /**
@@ -207,22 +209,26 @@ contract DSCEngine is ReentrancyGuard {
         if (startingUserHealthFactor >= MIN_HEALTH_FACTOR) {
             revert DSCEngine__HealthFactorOk();
         }
+
         uint256 tokenAmountFromDebtToCover = getTokenAmountFromUSD(collateral, debtToCover);
         // Give liquidator 10% bonus
         // so we are giving liquidator $110 of WETH for 100 DSC
         // we should implement a feature to liquidate protocol in case of insolvency
         // and sweep extra amounts in treasury
         uint256 bonusCollateral = (tokenAmountFromDebtToCover * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
+
         uint256 totalCollateralToRedeem = tokenAmountFromDebtToCover + bonusCollateral;
+
         //effects
         // burn dsc
         // redeem collateral to liquidator
         //interactions
         _redeemCollateral(collateral, totalCollateralToRedeem, user, msg.sender);
+
         _burnDSC(user, msg.sender, debtToCover);
         uint256 endingUserHealthFactor = _healthFactor(user);
         if (endingUserHealthFactor <= startingUserHealthFactor) {
-            revert DSC_Engine__HealthFactorNotImproved();
+            revert DSCEngine__HealthFactorNotImproved();
         }
         _revertIfHealthFactorIsBroken(msg.sender);
     }
@@ -235,7 +241,9 @@ contract DSCEngine is ReentrancyGuard {
         return _getAccountInformation(user);
     }
 
-    function getHealthFactor() external view {}
+    function getHealthFactor(address user) external view returns (uint256) {
+        return _healthFactor(user);
+    }
 
     /////////////////////////
     // Public Functions  //
@@ -288,15 +296,15 @@ contract DSCEngine is ReentrancyGuard {
             revert DSCEngine__TransferFailed();
         }
         i_dsc.burn(amount);
+        emit DSCBurnt(user, dscFrom, amount);
     }
 
     function _redeemCollateral(address collateralTokenAddress, uint256 amount, address user, address to) private {
         // checks: check if health factor will get broken after redemption
-        // effects: update state to take in DSC anf give out collateral tokens accordingly
+        // effects: update state to take in DSC and give out collateral tokens accordingly
         // what if amount>deposited amount, uint256 protects us
         s_collateralDeposited[user][collateralTokenAddress] -= amount;
         emit CollateralRedeemed(user, to, collateralTokenAddress, amount);
-        _revertIfHealthFactorIsBroken(user);
 
         // interactions: perform collateral transfer
         bool success = IERC20(collateralTokenAddress).transfer(to, amount);
@@ -333,6 +341,11 @@ contract DSCEngine is ReentrancyGuard {
         (uint256 totalCollateralInUSD, uint256 totalDscMinted) = _getAccountInformation(user);
         // totalCollateralInUSD / totalDscMinted will not work as decimals don't work in solidity, 1.5==1
         uint256 collateralAdjustedForThreshold = (totalCollateralInUSD * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
+
+        // handle health factor calculation when total Dsc minted is zero
+        if (totalDscMinted == 0) {
+            return type(uint256).max;
+        }
         return (collateralAdjustedForThreshold * PRECISION) / totalDscMinted;
     }
 
